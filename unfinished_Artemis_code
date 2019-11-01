@@ -1,0 +1,407 @@
+//Colin Cunningham
+//Venkat Prisad
+//acoustic-wells
+/*
+ * this is code for the arrtemis nano, which will act as the master in this application. It uses the regular interupt on timer run timed code, then wake up for non-time sensitive stuff.
+ * it fills a buffer in sram (sram_buffer) by sampling on A0 at a rate defined by the variable freq. Once half this buffer is filled, it gets downsampled(by a factor of oversample_rate) and written to a file on the 
+ * sd card. This occors while the device samples to the other half of the buffer, this avoids any unpleasant write access stuff or glitches. The name on this file will be the timestamp for when the last datapoint was 
+ * recorded according to the onboard RTC. This RTC will be updated to unix standard upon the powerup of the boron, this should keep ms accuracy over long periods. There will also be a file named unsent_items.txt, this  
+ * is simply a list of unsent files, we'll erase them as we have confirmed sends from the boron. 
+ * 
+ * The boron-artemis communication will be via i2c with 2.2k pullup resistors. The artemis will act as the master in this communication while the boron will act as slave using clock stretching for flow control. This will 
+ * all occor in the non-time crutial artemis code, so it will not interrupt sampling. The boron code will package the files into aws json formats and send them away using .publish for safety. The boron will signal back to  
+ * the artemis when an entire file has been confirmed sent. This way the artemis can cross the file off the waiting list. after that list is emptied or the boron has been on and cant connect, the artemis will disable it 
+ * untill the next sendoff.. We'll build some idle time in there in case the remote sensor has data.
+ * 
+ * As for the remote sensor (accelerometer) This can/should be pretty independent of everything else. This will consist of another ambique for sampling and a xenon for comms. The ambique should have a similar architecture
+ * to the one on the boron, although a much lower sampling rate. This can boot up every once in a while, more frequently(maybe every 10 mins it takes much less pwr) to test if it can reach the cloud(it will be able to if the boron is on). If this
+ * is the case it can send off the data in much the same way as the boron interaction went. In theory the boron code doesent have any mention of the xenon, it just gets used as a relay automagically?? we will leave some idle 
+ * time in the boron to allow for this just in case...
+ * 
+ * 
+ * TODO: 
+ * artemis: 
+ * i2c sendoff
+ * clock tuning program for each artemis. use gps Venkat task
+ * 
+ * Boron: everything(sounds bad when u put it like that but not that much goes on here) need to do the stupid encoding thing, but theres a lib for that :)
+ * 
+ * 
+ * Pinages....
+ * Bat+               Particle battery
+ * bat-               particle/common gnd
+ * artemis a0         analog in
+ * artemis a15        boron enable
+ * artemis a3         boron d6 boron ready signal
+ * artemis 8          sd card CS
+ * artemis sck1          boron sck       //artemis uses silly little cable for this 
+ * artemis sda1          boron sda
+ * artemis 13 miso    sd miso
+ * artemis 12 mosi    sd mosi     (addalogger pins arent labeled... look @ mine or the board schematic) i have to look up
+ * 
+ * 
+ */
+
+#include "am_mcu_apollo.h"
+#include "am_bsp.h"
+#include "am_util.h"
+#include "RTC.h"
+#include "SD.h"
+#include "Wire.h"
+
+/*
+ * system state 
+ * 0 = sampling only/boron off
+ * 1 = awaiting boron boot1
+ * 2 = awaiting boron boot2
+ * 3 = data send mode
+ * 
+ * its always sampling though... :)
+ */
+int state_val = 0;          //state machine, see aboce
+long int long_time_bookmark = 0; //keeps track of longer times than the bookmark does, used and reset by state machine
+#define ticks_between_sendsoffs 128*60 //one minute
+
+int freq = 128;   //ticker frequency in hz, should b 128, 256...    original freq- downsampled by oversample_rate
+#define TIMER_FREQ 32768L //Counter/Timer 6 will use the xtal@ 32768
+#define BUFFER_SIZE_KB 4  //size of buffer
+#define oversample_rate 4   //averages the past n samples b4 writing
+
+uint32_t sysTicksToSleep = TIMER_FREQ / freq ;
+#define BUFFER_INT_NUM (500 * BUFFER_SIZE_KB)    // number of readings in total buffer
+volatile short int* sram_buffer = (short int*) malloc(BUFFER_INT_NUM * sizeof(short int));       //buffer used for storing samples before writing to flash. volatile and 2x the space so it never steps on itself..
+//sizeof(int)= 4 .. so a 128*4=512 which is apparently the size of most memory pages. 
+
+volatile long int bookmark = 0;                                      //placemark in buffer
+volatile int flash_flag1 = 0;                                        //flags to tell if the 1st or 2nd halves of the sram buffer need to be stowed in sd
+volatile int flash_flag2 = 0;                                        //i use 2 such that 1 half is being recorded while the other is coppied.. probably not necessary, the spi code i think makes its own bffr(Sram)
+
+
+
+// set up variables using the SD utility library functions:
+Sd2Card card;
+SdVolume volume;
+SdFile root;
+String filename = "";
+String file_header = "";  //used to timestamp the file at the beginning. 
+
+//file # does not get reset on reboot- so we don't overwrite stuff
+#pragma PERSISTENT
+int file_number=2;    //number/name of file we're writing
+
+
+
+///rtc real time clock stuff
+APM3_RTC myRTC; //Create instance of RTC class
+
+
+//fxn defs
+void inline write_buffer_to_card();
+
+
+
+void setup()
+{
+
+
+  card.init(SPI_HALF_SPEED, 8);       //sd card init with cs on pin 8 
+  pinMode(19, OUTPUT);                //debug
+  digitalWrite(19, LOW);
+  pinMode(A3, INPUT);                  //ready sense for boron, probs not necessary w i2c
+  pinMode(A15, OUTPUT);               //enable for boron
+  
+  digitalWrite(A15, LOW);             //disable boron
+  analogReadResolution(14);           //last 2 bits are 0s, 2 msb's start as 0s but for the oversampling I just add the 4 togather, so they contain info. i dont divide, it'd be slower and you'd lose precision
+  setupWakeTimer();
+  
+
+}
+
+
+void loop()
+{
+
+  write_buffer_to_card();   //writes buffer to card if needbe
+
+
+  /* 'operating system' state machine
+   * controls the boron booting and comms
+   */
+switch(state_val){
+  
+  ///sampling case::
+  case 0:    
+    if(long_time_bookmark >= ticks_between_sendsoffs)
+    {
+            digitalWrite(A15, HIGH);             //enable boron
+            state_val = 1;
+    }
+  break;
+  
+  //wait state 1, I'm just waiting for boron to boot enough to signal that its not yet booted.. it's like half a second wait then it will wait till the boron ready pin is high
+  case 1:
+    if(long_time_bookmark >= (ticks_between_sendsoffs+50))
+    {
+            state_val = 2;
+              digitalWrite(19, HIGH);
+
+    }
+  break;
+  
+  //wait case 2, this is when I wait for boron to aquire cell signal, the 60000 ticks is a timeout, about 10 mins, it'll go back to state 0 and reset the clock
+  case 2:
+    if(digitalRead(A3))
+    {
+      state_val=3;
+    }
+    if(long_time_bookmark >= (ticks_between_sendsoffs + 60000))    //timout/nolte
+    {
+      state_val=0;
+      long_time_bookmark=0;
+      digitalWrite(A15, LOW);             //disable boron
+
+    }
+  break;
+
+  //this is the actual boron communications state, if it finds a file that needs sending and the boron is ready to rx it, it'll send the file to boron
+  case 3: 
+    if(digitalRead(A3)) //ensures boron ready to recieve
+    {
+      int filefound = file_finder();
+      if(filefound != -1)
+      {
+        file_sender(filefound);
+      }
+      else
+      {
+        //if no files need sending, returns to state 0 and resets long_time_bookmark
+      state_val=0;
+      long_time_bookmark=0;
+      digitalWrite(A15, LOW);             //disable boron
+      }
+    }
+  break;
+}
+
+//sleeep
+  am_hal_sysctrl_sleep(AM_HAL_SYSCTRL_SLEEP_DEEP);
+
+}
+
+
+
+
+
+//We use counter/timer 6 for this 
+void setupWakeTimer()
+{
+  //Clear compare interrupt
+  am_hal_stimer_int_clear(AM_HAL_STIMER_INT_COMPAREG); //Use CT6
+
+  am_hal_stimer_int_enable(AM_HAL_STIMER_INT_COMPAREG); // Enable C/T G=6
+
+  //sets for 32khz clk
+  am_hal_stimer_config(AM_HAL_STIMER_CFG_CLEAR | AM_HAL_STIMER_CFG_FREEZE);
+  am_hal_stimer_config(AM_HAL_STIMER_XTAL_32KHZ | AM_HAL_STIMER_CFG_COMPARE_G_ENABLE);
+
+  //Setup ISR to trigger when the number of tics have elapsed
+  am_hal_stimer_compare_delta_set(6, sysTicksToSleep);
+
+  //Enable the timer interrupt in the NVIC.
+  NVIC_EnableIRQ(STIMER_CMPR6_IRQn);
+}
+
+
+/*
+ * isr for timer, does the actual stamping on time and sto's it on buffer
+ */
+
+
+extern "C" void am_stimer_cmpr6_isr(void)
+{
+  //this resets the stimer. I'd like to use the ctimer in repeat_mode to avoid this stuff but i couldn't figure out how to set it up. still this should b adequate
+  uint32_t ui32Status = am_hal_stimer_int_status_get(false);
+  if (ui32Status & AM_HAL_STIMER_INT_COMPAREG)
+  {
+    am_hal_stimer_int_clear(AM_HAL_STIMER_INT_COMPAREG);
+
+    //Reset compare value. ISR will trigger when the number of ms have elapsed
+    am_hal_stimer_compare_delta_set(6, sysTicksToSleep);
+  }
+
+
+
+
+  sram_buffer[bookmark] = analogRead(A0) >> 2;    //2 lsb's are padding??
+
+  bookmark++;           //increments
+  bookmark %= BUFFER_INT_NUM;     //rolls over
+
+  /////////////////signals to main code that it's time to write to sd card
+  if (bookmark == 1)
+  {
+    flash_flag2 = 1;
+  }
+  else
+  {
+    flash_flag2 = 0;
+  }
+
+  if (bookmark == ((BUFFER_INT_NUM/2)+1))
+  {
+    flash_flag1 = 1;
+  }
+  else
+  {
+    flash_flag1 = 0;
+  }
+
+  long_time_bookmark++;   //used by state machine to measure time
+}
+
+//gets the rtc val and writes the global string filename to it so the next file is timestamped to the time of call
+//SD card must b open to call!!!!
+void getfilename()
+{
+      myRTC.getTime();
+    filename = String(file_number) + ".bin";   //P is for pressure sensor data...
+
+    
+   ///writes the stamp to a separate .txt file w the same name...
+    File txtFile = SD.open(String(file_number)+".txt", FILE_WRITE);
+    txtFile.print(String(myRTC.year) + "_" + String(myRTC.month) + "_" + String(myRTC.dayOfMonth) + "_" + String(myRTC.hour) + "_" + String(myRTC.minute) + "_" + String(myRTC.seconds) + "_" + String(myRTC.hundredths));
+    txtFile.close();
+
+        file_number++;
+}
+
+/*
+ * checks which half of the buffer needs to be written, if any and writes that info to the sd card
+ * uses buffer flags to see which side needs to b written then carries out the operation, 
+ * using getfilename it makes one file with data and another file w timestamping. 
+ * there's a 8 char limit on file names so the files are named a number 
+ */
+
+void inline write_buffer_to_card()
+{
+  
+  if (flash_flag1 == 1)
+  {
+
+    //write card1...    also reduces sample rate by a factor of oversample_rate uses adition, so you're not throwing away dynamic range
+    SD.begin(8); 
+
+    ///timestamps the file
+    getfilename();
+    File dataFile = SD.open(filename, FILE_WRITE);
+    for(long int i=0; i <= ((BUFFER_INT_NUM/2)-1); i += oversample_rate)
+    {
+      /////downsampling1.. don't divide or you'll lose info, trying not to clip though.. 
+      short int avg = 0;
+      for(int p = 0; p <= (oversample_rate-1); p++)
+      {
+        avg += sram_buffer[p+i];
+      }
+      dataFile.print(avg);
+    }
+    dataFile.close();
+    SD.end();
+    
+  }
+  if (flash_flag2 == 1)
+  {
+    SD.begin(8);
+
+    ///timestamps the file
+    getfilename();
+    File dataFile = SD.open(filename, FILE_WRITE);
+    for(long int i=(BUFFER_INT_NUM/2); i <= (BUFFER_INT_NUM-1); i+=oversample_rate)
+    {
+      /////downsampling2
+      short int avg = 0;
+      for(int p = 0; p <= (oversample_rate-1); p++)
+      {
+        avg += sram_buffer[p+i];
+      }
+      dataFile.print(avg);    }
+    dataFile.close();
+    SD.end(); 
+  }
+}
+
+
+/*
+ * finds the next file that needs transmission
+ * files are sent in a filo stack, I tries to send the most recent file 1st then goes back from there
+ * Instead of a filelist, I use blank .snt files to indicate that the file was sent
+ * 
+ * file number of a file that needs to b sent will be returned
+ * if no files in need of sending, -1 will be returned
+ */
+int file_finder()
+{
+  SD.begin(8);
+  int c = file_number;
+  int finish = 0;   // if its iterating and finds a .bin file without an associated snt file, itll return or if it gets down to the bottom of lst
+  while(  !(SD.exists(String(c) + ".bin") && !SD.exists(String(c) + ".snt"))   ||  (c <= -1) )
+    { 
+      c--;
+    }
+  SD.end();
+  return c;
+}
+
+/*sends out the selected file, ensure that the file exists and needs to be sent with file_finder..
+  input is the file number of file you want sent. 
+  if the file is confirmed sent by boron, this will create the .snt file, to indicate that it's been sent already. 
+  
+*/
+void file_sender(int num)
+{
+
+  int index = 0;    //index of file sent w i2c message increments by 28 bytes per message
+  //first we open the timestamp file and send that over. the 1st 28 bytes of the message are timestamp
+  SD.begin(8);
+  File readFile = SD.open(String(num)+".txt", FILE_READ);
+  
+  //i2c wire library limited to 32 bytes. I use 1st four(int) for adressing, thats just read as the buffer offest on boron
+  Wire.begin();
+  Wire.beginTransmission(8);
+  Wire.write(index);
+  for(int x = 0; x <= 27; x++);
+  {
+    if(readFile.available())
+    {
+      Wire.write(readFile.read());
+    }
+  }
+  index += 28;
+  Wire.endTransmission();
+  
+  readFile.close();     // finished timestamp, starting on actual data now..
+  File readFile2 = SD.open(String(num)+".bin", FILE_READ);
+  while(readFile2.available() >= 28)
+    {
+    Wire.beginTransmission(8);
+    Wire.write(index);
+    for(int i=0; i <= 27; i++)
+    {
+      Wire.write(readFile2.read());
+    }
+    index += 28;
+    Wire.endTransmission();
+    }
+    ///sends last possibly incomplete i2c frame
+    Wire.beginTransmission(8);
+    Wire.write(index);
+  while(readFile2.available())
+    {
+      Wire.write(readFile2.read());
+    }
+    Wire.endTransmission();
+
+
+    //writes a blank dummy file that says this file has been sent
+  File newfile = SD.open(String(num)+".snt", FILE_WRITE);
+  newfile.close();
+}
